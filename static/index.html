@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>openWakeWord Mic Stream</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <div>
+          <p class="eyebrow">Browser mic to Python</p>
+          <h1>openWakeWord listener</h1>
+        </div>
+
+        <div class="status-grid">
+          <div>
+            <span>Wake word</span>
+            <strong id="wakeword">loading</strong>
+          </div>
+          <div>
+            <span>Score</span>
+            <strong id="score">0.000</strong>
+          </div>
+          <div>
+            <span>State</span>
+            <strong id="state">idle</strong>
+          </div>
+        </div>
+
+        <meter id="meter" min="0" max="1" low="0.25" high="0.5" optimum="0.8" value="0"></meter>
+
+        <div class="actions">
+          <button id="start" type="button">Start mic</button>
+          <button id="stop" type="button" disabled>Stop</button>
+        </div>
+
+        <pre id="log" aria-live="polite"></pre>
+      </section>
+    </main>
+
+    <script src="/static/app.js" type="module"></script>
+  </body>
+</html>
