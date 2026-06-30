@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import time
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +8,8 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+from wakeword_detector import WakeWordDetector
 
 
 ROOT = Path(__file__).parent
@@ -40,57 +40,12 @@ def parse_args() -> argparse.Namespace:
 ARGS = parse_args()
 
 
-class WakeWordDetector:
-    def __init__(self, wakeword: str, threshold: float, debounce: float) -> None:
-        self.wakeword = wakeword
-        self.threshold = threshold
-        self.debounce = debounce
-        self._model: Any | None = None
-        self._lock = asyncio.Lock()
-        self._last_detection = 0.0
-
-    def load(self) -> None:
-        import openwakeword
-        from openwakeword.utils import download_models
-        from openwakeword.model import Model
-
-        if ARGS.download_models:
-            download_models(model_names=[self.wakeword])
-
-        if self.wakeword not in openwakeword.MODELS:
-            choices = ", ".join(sorted(openwakeword.MODELS.keys()))
-            raise ValueError(f"Unknown wake word '{self.wakeword}'. Choose one of: {choices}")
-
-        # ONNX keeps setup simple across WSL, Linux, and Windows.
-        self._model = Model(
-            wakeword_models=[self.wakeword],
-            inference_framework="onnx",
-        )
-
-    async def predict(self, audio: np.ndarray) -> dict[str, Any]:
-        if self._model is None:
-            raise RuntimeError("Wake word model has not loaded")
-
-        async with self._lock:
-            predictions = self._model.predict(audio)
-
-        score = float(predictions.get(self.wakeword, 0.0))
-        now = time.monotonic()
-        detected = score >= self.threshold and now - self._last_detection >= self.debounce
-        if detected:
-            self._last_detection = now
-
-        return {
-            "type": "prediction",
-            "wakeword": self.wakeword,
-            "score": score,
-            "detected": detected,
-            "threshold": self.threshold,
-            "all_scores": {key: float(value) for key, value in predictions.items()},
-        }
-
-
-detector = WakeWordDetector(ARGS.wakeword, ARGS.threshold, ARGS.debounce)
+detector = WakeWordDetector(
+    ARGS.wakeword,
+    ARGS.threshold,
+    ARGS.debounce,
+    download_models=ARGS.download_models,
+)
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
