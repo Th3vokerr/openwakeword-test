@@ -38,6 +38,8 @@ const STT_MODEL = process.env.STT_MODEL || "whisper-large-v3:free";
 const STT_LANGUAGE = process.env.STT_LANGUAGE || undefined;
 const STT_PROMPT = process.env.STT_PROMPT || undefined;
 const TRANSCRIBE_RECORDINGS = process.env.TRANSCRIBE_RECORDINGS !== "0";
+const DEBUG_LOGS = process.env.DEBUG_LOGS === "1";
+const LEVEL_LOG_INTERVAL_MS = Number(process.env.LEVEL_LOG_INTERVAL_MS || 1000);
 
 if (!TOKEN) {
   console.error("Set DISCORD_TOKEN before starting the bot.");
@@ -50,6 +52,18 @@ const sttClient = NAGA_API_KEY
       baseURL: NAGA_BASE_URL,
     })
   : null;
+
+function log(message) {
+  console.log(`[${new Date().toISOString()}] ${message}`);
+}
+
+function debug(message) {
+  if (DEBUG_LOGS) log(message);
+}
+
+function warn(message) {
+  console.warn(`[${new Date().toISOString()}] ${message}`);
+}
 
 function rms16(samples) {
   if (samples.length === 0) return 0;
@@ -89,6 +103,11 @@ class WakewordWorker {
     ];
     if (process.env.DOWNLOAD_MODELS === "1") args.push("--download-models");
 
+    log(
+      `Starting wakeword worker: ${PYTHON} ${args.join(" ")} ` +
+        `(threshold=${THRESHOLD}, debounce=${DEBOUNCE}, debug=${DEBUG_LOGS ? "on" : "off"})`
+    );
+
     this.child = spawn(PYTHON, args, {
       cwd: __dirname,
       stdio: ["pipe", "pipe", "inherit"],
@@ -96,10 +115,22 @@ class WakewordWorker {
     this.nextId = 1;
     this.pending = new Map();
     this.buffer = "";
+    this.ready = false;
+    this.dead = false;
 
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", (chunk) => this.handleStdout(chunk));
+    this.child.on("error", (error) => {
+      this.dead = true;
+      warn(`Wakeword worker failed to start: ${error.message}`);
+      for (const { reject } of this.pending.values()) {
+        reject(error);
+      }
+      this.pending.clear();
+    });
     this.child.on("exit", (code) => {
+      this.dead = true;
+      warn(`Wakeword worker exited with code ${code}`);
       for (const { reject } of this.pending.values()) {
         reject(new Error(`wakeword worker exited with code ${code}`));
       }
@@ -115,13 +146,20 @@ class WakewordWorker {
       this.buffer = this.buffer.slice(newlineIndex + 1);
       if (!line.trim()) continue;
 
-      const message = JSON.parse(line);
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        warn(`Wakeword worker sent non-JSON output: ${line}`);
+        continue;
+      }
       if (message.type === "ready") {
-        console.log(`Wakeword worker ready for ${message.wakeword}`);
+        this.ready = true;
+        log(`Wakeword worker ready for ${message.wakeword} (threshold=${message.threshold})`);
         continue;
       }
       if (message.type === "error") {
-        console.error(`Wakeword worker error: ${message.message}`);
+        warn(`Wakeword worker error: ${message.message}`);
         continue;
       }
 
@@ -134,6 +172,10 @@ class WakewordWorker {
   }
 
   predict(userId, audioFrame) {
+    if (this.dead || this.child.stdin.destroyed) {
+      return Promise.reject(new Error("wakeword worker is not running"));
+    }
+
     const id = this.nextId++;
     const payload = {
       id,
@@ -169,8 +211,12 @@ class GuildRecorder {
     this.finishing = false;
     this.silenceTimer = null;
     this.maxTimer = null;
+    this.lastLevelLogAt = new Map();
 
-    connection.receiver.speaking.on("start", (userId) => this.listenToUser(userId));
+    connection.receiver.speaking.on("start", (userId) => {
+      debug(`Discord speaking start user=${userId}`);
+      this.listenToUser(userId);
+    });
   }
 
   listenToUser(userId) {
@@ -186,14 +232,17 @@ class GuildRecorder {
     });
 
     this.userStreams.set(userId, decoder);
+    debug(`Subscribed to voice packets for user=${userId}`);
     opusStream.pipe(decoder);
     decoder.on("data", (pcm) => this.handlePcm(userId, pcm));
     decoder.once("end", () => {
       this.userStreams.delete(userId);
+      debug(`Voice stream ended for user=${userId}`);
       if (this.activeUserId === userId) this.scheduleSilenceFinish();
     });
-    decoder.once("error", () => {
+    decoder.once("error", (error) => {
       this.userStreams.delete(userId);
+      warn(`Voice decoder error for user=${userId}: ${error.message}`);
       if (this.activeUserId === userId) this.scheduleSilenceFinish();
     });
   }
@@ -202,6 +251,7 @@ class GuildRecorder {
     const now = Date.now();
     const mono16k = discordPcmToMono16k(pcm);
     const level = rms16(mono16k);
+    this.logLevel(userId, level, pcm.length);
 
     if (this.activeUserId) {
       if (userId !== this.activeUserId) return;
@@ -227,7 +277,21 @@ class GuildRecorder {
     while (!this.activeUserId && wakeBuffer.length - offset >= frameBytes) {
       const frame = wakeBuffer.subarray(offset, offset + frameBytes);
       offset += frameBytes;
-      const result = await this.worker.predict(userId, frame);
+      let result;
+      try {
+        result = await this.worker.predict(userId, frame);
+      } catch (error) {
+        warn(`Wake prediction failed for user=${userId}: ${error.message}`);
+        break;
+      }
+
+      if (DEBUG_LOGS || result.score >= 0.05 || result.detected) {
+        log(
+          `Wake score user=${userId} wakeword=${WAKEWORD} ` +
+            `score=${Number(result.score).toFixed(4)} detected=${result.detected}`
+        );
+      }
+
       if (result.detected && !this.activeUserId) {
         await this.startRecording(userId);
         break;
@@ -235,6 +299,20 @@ class GuildRecorder {
     }
 
     this.wakeBuffers.set(userId, wakeBuffer.subarray(offset));
+  }
+
+  logLevel(userId, level, pcmBytes) {
+    if (!DEBUG_LOGS) return;
+
+    const now = Date.now();
+    const last = this.lastLevelLogAt.get(userId) || 0;
+    if (now - last < LEVEL_LOG_INTERVAL_MS) return;
+
+    this.lastLevelLogAt.set(userId, now);
+    debug(
+      `Voice level user=${userId} rms=${level.toFixed(1)} ` +
+        `silenceRms=${SILENCE_RMS} pcmBytes=${pcmBytes} active=${this.activeUserId || "none"}`
+    );
   }
 
   pushPreRoll(userId, pcm) {
@@ -257,6 +335,7 @@ class GuildRecorder {
     this.wakeBuffers.clear();
     this.scheduleSilenceFinish();
     this.maxTimer = setTimeout(() => void this.finish("max length"), MAX_RECORDING_MS);
+    log(`Wake detected. Recording user=${userId} name=${this.activeDisplayName}`);
     await this.textChannel.send(`Wake word detected from <@${userId}>. Recording until they stop talking...`);
   }
 
@@ -278,11 +357,13 @@ class GuildRecorder {
 
     const userName = this.activeDisplayName;
     const frames = this.recordingFrames;
+    const durationMs = frames.reduce((sum, frame) => sum + frameDurationMs(frame.length), 0);
     this.activeUserId = null;
     this.activeDisplayName = "";
     this.recordingFrames = [];
 
     try {
+      log(`Finishing recording user=${userName} reason=${reason} frames=${frames.length} durationMs=${Math.round(durationMs)}`);
       const mp3Path = await pcmFramesToMp3(frames);
       const transcript = await transcribeRecording(mp3Path);
       const content = [
@@ -298,6 +379,7 @@ class GuildRecorder {
       });
       fs.rmSync(path.dirname(mp3Path), { recursive: true, force: true });
     } catch (error) {
+      warn(`Recording processing failed: ${error.stack || error.message}`);
       await this.textChannel.send(`Recording finished, but processing failed: ${error.message}`);
     } finally {
       this.finishing = false;
@@ -309,6 +391,7 @@ async function transcribeRecording(mp3Path) {
   if (!TRANSCRIBE_RECORDINGS) return "";
   if (!sttClient) return "STT skipped: set NAGA_API_KEY in .env.";
 
+  log(`Transcribing ${path.basename(mp3Path)} with ${STT_MODEL} at ${NAGA_BASE_URL}`);
   const transcription = await sttClient.audio.transcriptions.create({
     model: STT_MODEL,
     file: fs.createReadStream(mp3Path),
@@ -316,6 +399,7 @@ async function transcribeRecording(mp3Path) {
     prompt: STT_PROMPT,
   });
 
+  log(`Transcription done, chars=${transcription.text?.length || 0}`);
   return transcription.text?.trim() || "";
 }
 
@@ -324,6 +408,7 @@ async function pcmFramesToMp3(frames) {
   const rawPath = path.join(dir, "recording.pcm");
   const mp3Path = path.join(dir, "recording.mp3");
   fs.writeFileSync(rawPath, Buffer.concat(frames));
+  log(`Encoding MP3 from ${frames.length} PCM frames`);
 
   const ffmpeg = ffmpegStatic || "ffmpeg";
   const child = spawn(ffmpeg, [
@@ -352,6 +437,7 @@ async function pcmFramesToMp3(frames) {
     throw new Error(`ffmpeg exited with code ${code}`);
   }
   fs.rmSync(rawPath, { force: true });
+  log(`MP3 encoded: ${mp3Path}`);
   return mp3Path;
 }
 
@@ -367,7 +453,12 @@ const worker = new WakewordWorker();
 const recorders = new Map();
 
 client.once(Events.ClientReady, (readyClient) => {
-  console.log(`Logged in as ${readyClient.user.tag}`);
+  log(`Logged in as ${readyClient.user.tag}`);
+  log(
+    `Config wakeword=${WAKEWORD} threshold=${THRESHOLD} silenceMs=${SILENCE_MS} ` +
+      `silenceRms=${SILENCE_RMS} transcribe=${TRANSCRIBE_RECORDINGS ? "on" : "off"} ` +
+      `sttModel=${STT_MODEL} debug=${DEBUG_LOGS ? "on" : "off"}`
+  );
 });
 
 client.on(Events.MessageCreate, async (message) => {
@@ -388,6 +479,7 @@ client.on(Events.MessageCreate, async (message) => {
       selfDeaf: false,
     });
     await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    log(`Joined voice channel guild=${voiceChannel.guild.id} channel=${voiceChannel.id}`);
 
     const recorder = new GuildRecorder(connection, message.channel, worker);
     recorders.set(message.guild.id, recorder);
@@ -402,6 +494,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
     connection.destroy();
     recorders.delete(message.guild.id);
+    log(`Left voice channel guild=${message.guild.id}`);
     await message.reply("Stopped listening.");
   }
 });
