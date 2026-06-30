@@ -13,7 +13,7 @@ from wakeword_detector import WakeWordDetector
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Line-oriented openWakeWord worker")
-    parser.add_argument("--wakeword", default="hey_jarvis")
+    parser.add_argument("--wakeword", default="alexa")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--debounce", type=float, default=1.5)
     parser.add_argument("--download-models", action="store_true")

@@ -7,6 +7,7 @@ const { once } = require("node:events");
 require("dotenv").config();
 
 const { Client, Events, GatewayIntentBits, AttachmentBuilder } = require("discord.js");
+const OpenAI = require("openai");
 const {
   EndBehaviorType,
   entersState,
@@ -26,16 +27,29 @@ const SILENCE_MS = Number(process.env.SILENCE_MS || 1100);
 const SILENCE_RMS = Number(process.env.SILENCE_RMS || 450);
 const MAX_RECORDING_MS = Number(process.env.MAX_RECORDING_MS || 30000);
 const PREFIX = process.env.BOT_PREFIX || "!";
-const WAKEWORD = process.env.WAKEWORD || "hey_jarvis";
+const WAKEWORD = process.env.WAKEWORD || "alexa";
 const THRESHOLD = process.env.WAKEWORD_THRESHOLD || "0.5";
 const DEBOUNCE = process.env.WAKEWORD_DEBOUNCE || "1.5";
 const PYTHON = process.env.PYTHON || ".venv/bin/python";
 const TOKEN = process.env.DISCORD_TOKEN;
+const NAGA_API_KEY = process.env.NAGA_API_KEY;
+const NAGA_BASE_URL = process.env.NAGA_BASE_URL || "https://api.naga.ac/v1";
+const STT_MODEL = process.env.STT_MODEL || "whisper-large-v3:free";
+const STT_LANGUAGE = process.env.STT_LANGUAGE || undefined;
+const STT_PROMPT = process.env.STT_PROMPT || undefined;
+const TRANSCRIBE_RECORDINGS = process.env.TRANSCRIBE_RECORDINGS !== "0";
 
 if (!TOKEN) {
   console.error("Set DISCORD_TOKEN before starting the bot.");
   process.exit(1);
 }
+
+const sttClient = NAGA_API_KEY
+  ? new OpenAI({
+      apiKey: NAGA_API_KEY,
+      baseURL: NAGA_BASE_URL,
+    })
+  : null;
 
 function rms16(samples) {
   if (samples.length === 0) return 0;
@@ -270,17 +284,39 @@ class GuildRecorder {
 
     try {
       const mp3Path = await pcmFramesToMp3(frames);
+      const transcript = await transcribeRecording(mp3Path);
+      const content = [
+        `Recording from ${userName} (${reason}).`,
+        transcript ? `**Transcript:** ${transcript}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
       await this.textChannel.send({
-        content: `Recording from ${userName} (${reason}).`,
+        content,
         files: [new AttachmentBuilder(mp3Path, { name: "wakeword-recording.mp3" })],
       });
       fs.rmSync(path.dirname(mp3Path), { recursive: true, force: true });
     } catch (error) {
-      await this.textChannel.send(`Recording finished, but MP3 encoding failed: ${error.message}`);
+      await this.textChannel.send(`Recording finished, but processing failed: ${error.message}`);
     } finally {
       this.finishing = false;
     }
   }
+}
+
+async function transcribeRecording(mp3Path) {
+  if (!TRANSCRIBE_RECORDINGS) return "";
+  if (!sttClient) return "STT skipped: set NAGA_API_KEY in .env.";
+
+  const transcription = await sttClient.audio.transcriptions.create({
+    model: STT_MODEL,
+    file: fs.createReadStream(mp3Path),
+    language: STT_LANGUAGE,
+    prompt: STT_PROMPT,
+  });
+
+  return transcription.text?.trim() || "";
 }
 
 async function pcmFramesToMp3(frames) {
